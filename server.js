@@ -14,14 +14,29 @@ const PORT = process.env.PORT || 5000;
 
 // Create axios instance with default config
 const axiosInstance = axios.create({
-    timeout: parseInt(process.env.REQUEST_TIMEOUT) || 30000,
+    timeout: 30000, // Increase timeout to 30 seconds
     headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive',
-    }
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
+    },
+    httpsAgent: new (require('https').Agent)({
+        rejectUnauthorized: false,
+        keepAlive: true,
+        timeout: 30000
+    })
 });
 
 // Cache configuration
@@ -65,7 +80,7 @@ let HEADERS = {
 };
 
 // Cookie management with caching
-const getCookies = async (retries = 2) => {
+const getCookies = async (retries = 3) => {
     const now = Date.now();
     const cookieExpiry = parseInt(process.env.COOKIE_EXPIRY) || 300000; // 5 minutes default
 
@@ -76,10 +91,33 @@ const getCookies = async (retries = 2) => {
 
     for (let i = 0; i < retries; i++) {
         try {
-            console.log('Fetching new cookies...');
-            const response = await axiosInstance.get('https://www.nseindia.com/');
-            if (response.headers['set-cookie']) {
-                const cookies = response.headers['set-cookie'].map(cookie => cookie.split(';')[0]).join('; ');
+            console.log(`Fetching new cookies... Attempt ${i + 1}/${retries}`);
+            
+            // First get the main page
+            const mainResponse = await axiosInstance.get('https://www.nseindia.com/', {
+                maxRedirects: 5,
+                validateStatus: function (status) {
+                    return status >= 200 && status < 400; // Accept redirects
+                }
+            });
+
+            // Small delay between requests
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Then get the cookie page
+            const cookieResponse = await axiosInstance.get('https://www.nseindia.com/api/marketStatus', {
+                headers: {
+                    ...HEADERS,
+                    'Referer': 'https://www.nseindia.com/'
+                }
+            });
+
+            if (mainResponse.headers['set-cookie'] || cookieResponse.headers['set-cookie']) {
+                const cookies = [
+                    ...(mainResponse.headers['set-cookie'] || []),
+                    ...(cookieResponse.headers['set-cookie'] || [])
+                ].map(cookie => cookie.split(';')[0]).join('; ');
+
                 HEADERS.Cookie = cookies;
                 dataCache.cookies = { value: cookies, timestamp: now };
                 console.log('New cookies fetched successfully');
@@ -87,15 +125,19 @@ const getCookies = async (retries = 2) => {
             }
         } catch (error) {
             console.error(`Cookie fetch attempt ${i + 1} failed:`, error.message);
-            if (i === retries - 1) throw error;
-            await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
+            if (i === retries - 1) {
+                console.error('All cookie fetch attempts failed');
+                throw error;
+            }
+            // Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 10000)));
         }
     }
     return false;
 };
 
 // Optimized NSE request function
-const makeNSERequest = async (url, cacheKey, maxRetries = 2) => {
+const makeNSERequest = async (url, cacheKey, maxRetries = 3) => {
     const now = Date.now();
     if (dataCache[cacheKey]?.data && (now - dataCache[cacheKey].timestamp) < CACHE_DURATION) {
         console.log(`Using cached data for ${cacheKey}`);
@@ -104,8 +146,16 @@ const makeNSERequest = async (url, cacheKey, maxRetries = 2) => {
 
     for (let i = 0; i < maxRetries; i++) {
         try {
-            console.log(`Fetching data for ${cacheKey}, attempt ${i + 1}`);
-            const response = await axiosInstance.get(url, { headers: HEADERS });
+            console.log(`Fetching data for ${cacheKey}, attempt ${i + 1}/${maxRetries}`);
+            
+            // Add referer header for API requests
+            const response = await axiosInstance.get(url, {
+                headers: {
+                    ...HEADERS,
+                    'Referer': 'https://www.nseindia.com/'
+                }
+            });
+
             if (response.data) {
                 dataCache[cacheKey] = { data: response.data, timestamp: now };
                 console.log(`Data fetched successfully for ${cacheKey}`);
@@ -114,8 +164,18 @@ const makeNSERequest = async (url, cacheKey, maxRetries = 2) => {
         } catch (error) {
             console.error(`Request failed for ${cacheKey}, attempt ${i + 1}:`, error.message);
             if (i === maxRetries - 1) throw error;
-            await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
-            await getCookies();
+            
+            // Exponential backoff with max delay of 10 seconds
+            const delay = Math.min(1000 * Math.pow(2, i), 10000);
+            console.log(`Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            
+            // Try to refresh cookies before next attempt
+            try {
+                await getCookies();
+            } catch (cookieError) {
+                console.error('Failed to refresh cookies:', cookieError.message);
+            }
         }
     }
     throw new Error(`Failed to fetch data for ${cacheKey} after ${maxRetries} retries`);
