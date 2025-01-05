@@ -2,7 +2,7 @@
 try {
     require('dotenv').config();
 } catch (error) {
-    // Silently continue if no .env file
+    console.error('Error loading .env file:', error);
 }
 
 const express = require('express');
@@ -11,6 +11,18 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Create axios instance with default config
+const axiosInstance = axios.create({
+    timeout: parseInt(process.env.REQUEST_TIMEOUT) || 30000,
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+    }
+});
 
 // Cache configuration
 const CACHE_DURATION = 5000; // 5 seconds cache
@@ -21,62 +33,60 @@ let dataCache = {
 };
 
 // Configure CORS with environment variables
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
-    ? process.env.ALLOWED_ORIGINS.split(',') 
-    : ['http://localhost:3000', 'https://stock-data-eight.vercel.app'];
+const allowedOrigins = [
+    'http://localhost:3000',
+    'https://stock-data-eight.vercel.app'
+];
 
 app.use(cors({
     origin: function (origin, callback) {
         // allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         
-        if (allowedOrigins.indexOf(origin) === -1) {
-            return callback(null, true);
+        if (allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
         }
-        return callback(null, true);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true
+    credentials: true,
+    maxAge: 86400 // CORS preflight cache for 24 hours
 }));
 
-// NSE API endpoints
-const NSE_BASE_URL = 'https://www.nseindia.com/api';
-
-// Headers and cookies management
+// Headers management
 let HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br'
+    'Connection': 'keep-alive',
 };
-
-// Axios instance with optimized timeout
-const axiosInstance = axios.create({
-    timeout: 15000, // 15 seconds timeout
-    headers: HEADERS
-});
 
 // Cookie management with caching
 const getCookies = async (retries = 2) => {
     const now = Date.now();
-    if (dataCache.cookies.value && (now - dataCache.cookies.timestamp) < CACHE_DURATION) {
+    const cookieExpiry = parseInt(process.env.COOKIE_EXPIRY) || 300000; // 5 minutes default
+
+    if (dataCache.cookies?.value && (now - dataCache.cookies.timestamp) < cookieExpiry) {
         HEADERS.Cookie = dataCache.cookies.value;
         return true;
     }
 
     for (let i = 0; i < retries; i++) {
         try {
+            console.log('Fetching new cookies...');
             const response = await axiosInstance.get('https://www.nseindia.com/');
-            const cookies = response.headers['set-cookie'];
-            
-            if (cookies) {
-                const cookieString = cookies.join('; ');
-                HEADERS.Cookie = cookieString;
-                dataCache.cookies = { value: cookieString, timestamp: now };
+            if (response.headers['set-cookie']) {
+                const cookies = response.headers['set-cookie'].map(cookie => cookie.split(';')[0]).join('; ');
+                HEADERS.Cookie = cookies;
+                dataCache.cookies = { value: cookies, timestamp: now };
+                console.log('New cookies fetched successfully');
                 return true;
             }
         } catch (error) {
+            console.error(`Cookie fetch attempt ${i + 1} failed:`, error.message);
             if (i === retries - 1) throw error;
             await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
         }
@@ -88,23 +98,27 @@ const getCookies = async (retries = 2) => {
 const makeNSERequest = async (url, cacheKey, maxRetries = 2) => {
     const now = Date.now();
     if (dataCache[cacheKey]?.data && (now - dataCache[cacheKey].timestamp) < CACHE_DURATION) {
+        console.log(`Using cached data for ${cacheKey}`);
         return dataCache[cacheKey].data;
     }
 
     for (let i = 0; i < maxRetries; i++) {
         try {
+            console.log(`Fetching data for ${cacheKey}, attempt ${i + 1}`);
             const response = await axiosInstance.get(url, { headers: HEADERS });
             if (response.data) {
                 dataCache[cacheKey] = { data: response.data, timestamp: now };
+                console.log(`Data fetched successfully for ${cacheKey}`);
                 return response.data;
             }
         } catch (error) {
+            console.error(`Request failed for ${cacheKey}, attempt ${i + 1}:`, error.message);
             if (i === maxRetries - 1) throw error;
             await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
             await getCookies();
         }
     }
-    throw new Error('Failed to fetch data after retries');
+    throw new Error(`Failed to fetch data for ${cacheKey} after ${maxRetries} retries`);
 };
 
 // Utility function to make NSE requests with retries
@@ -284,6 +298,7 @@ app.get('/api/historical/:symbol', async (req, res) => {
 app.get('/api/indices', async (req, res) => {
     const startTime = Date.now();
     try {
+        console.log('Fetching indices data...');
         const marketStatus = getMarketStatus();
         await getCookies();
         
@@ -291,12 +306,21 @@ app.get('/api/indices', async (req, res) => {
             makeNSERequest(
                 'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050',
                 'nifty50'
-            ).catch(() => ({ data: [null] })),
+            ).catch(error => {
+                console.error('NIFTY 50 fetch error:', error.message);
+                return { data: [null] };
+            }),
             makeNSERequest(
                 'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20BANK',
                 'bankNifty'
-            ).catch(() => ({ data: [null] }))
+            ).catch(error => {
+                console.error('BANK NIFTY fetch error:', error.message);
+                return { data: [null] };
+            })
         ]);
+
+        console.log('NIFTY API Response:', nifty50Data);
+        console.log('BANKNIFTY API Response:', bankNiftyData);
 
         const indices = {
             marketStatus,
@@ -329,19 +353,24 @@ app.get('/api/indices', async (req, res) => {
                 totalTradedVolume: 0,
                 totalTradedValue: 0,
                 lastUpdateTime: new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })
-            },
-            performance: {
-                fetchTime: `${Date.now() - startTime}ms`,
-                cached: !!(dataCache.nifty50.data && dataCache.bankNifty.data)
             }
         };
 
+        console.log('API Performance:', {
+            timestamp: new Date().toLocaleTimeString(),
+            totalFetchTime: `${(Date.now() - startTime).toFixed(2)}ms`,
+            totalStocksFetched: nifty50Data?.data?.length + bankNiftyData?.data?.length || 0,
+            niftyStocks: nifty50Data?.data?.length || 0,
+            bankNiftyStocks: bankNiftyData?.data?.length || 0
+        });
+
         res.json(indices);
     } catch (error) {
+        console.error('Error in /api/indices:', error.message, error.stack);
         res.status(500).json({
-            error: 'Failed to fetch indices data',
+            error: 'Failed to fetch data from NSE',
             message: error.message,
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })
         });
     }
 });
@@ -351,6 +380,9 @@ app.get('/', (req, res) => {
     res.json({ message: 'Hello from Vercel Server!' });
 });
 
+// Start server
 app.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
+    console.log('Environment:', process.env.NODE_ENV);
+    console.log('Allowed Origins:', allowedOrigins);
 });
